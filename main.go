@@ -1,272 +1,42 @@
-// Package main is the entry point for the keploy application.
+// Package main is the entry point for the Keploy application.
+// Keploy is an open source API testing platform that captures and replays
+// API calls to generate test cases and data mocks automatically.
 package main
 
 import (
 	"context"
-	"fmt"
-	"net/http"
 	"os"
-	"runtime"
-	"runtime/debug"
-	"strconv"
-	"strings"
-	"time"
+	"os/signal"
+	"syscall"
 
-	"go.keploy.io/server/v3/cli"
-	"go.keploy.io/server/v3/cli/provider"
-	"go.keploy.io/server/v3/config"
-	userDb "go.keploy.io/server/v3/pkg/platform/yaml/configdb/user"
-	"go.keploy.io/server/v3/utils"
-	"go.keploy.io/server/v3/utils/log"
+	"github.com/keploy/keploy/v2/cmd"
 	"go.uber.org/zap"
-
-	_ "net/http/pprof"
-	"runtime/pprof"
 )
 
-// version is the version of the server and will be injected during build by ldflags, same with dsn
-// see https://goreleaser.com/customization/build/
-
-var version string
-var dsn string
-var apiServerURI = "http://localhost:8083"
-var gitHubClientID = "Iv23liFBvIVhL29i9BAp"
-
 func main() {
-	setVersion()
-	ctx := utils.NewCtx()
-	start(ctx)
-	os.Exit(utils.ErrCode)
-}
-
-func setVersion() {
-	if version == "" {
-		version = "3-dev"
-	}
-	utils.Version = version
-	utils.VersionIdentifier = "version"
-}
-
-func start(ctx context.Context) {
-	logger, logFile, err := log.New()
+	// Initialize a temporary logger for startup errors
+	logger, err := zap.NewProduction()
 	if err != nil {
-		fmt.Println("Failed to start the logger for the CLI", err)
-		return
-	}
-	utils.LogFile = logFile
-
-	// If KEPLOY_DEBUG_FILE is set, tee debug-level log records into that
-	// file in addition to whatever sinks log.New configured. Used by
-	// `keploy cloud replay` to capture the agent container's debug
-	// stream into the user's keploy folder via a bind mount; the
-	// support-bundle pipeline picks the file up automatically since it
-	// lives under cfg.Path. Also useful as a generic "give me the full
-	// debug log without --debug printing it to my terminal" knob for
-	// any keploy invocation.
-	debugFile, debugSink := maybeAttachDebugFileSink(logger)
-	if debugFile != nil {
-		defer func() {
-			if debugSink != nil {
-				if ferr := debugSink.Flush(); ferr != nil {
-					logger.Warn("KEPLOY_DEBUG_FILE: flush failed", zap.Error(ferr))
-				}
-			}
-			if cerr := debugFile.Close(); cerr != nil {
-				logger.Warn("KEPLOY_DEBUG_FILE: close failed", zap.Error(cerr))
-			}
-		}()
-	}
-
-	// Start pprof HTTP server for live profiling if PPROF_PORT is set
-	if pprofPort := os.Getenv("PPROF_PORT"); pprofPort != "" {
-		go func() {
-			addr := "localhost:" + pprofPort
-			logger.Info("pprof server starting", zap.String("addr", addr))
-			if err := http.ListenAndServe(addr, nil); err != nil {
-				logger.Error("pprof server failed; check that PPROF_PORT is a valid port and not already in use, or unset the env var to disable",
-					zap.String("port", pprofPort), zap.Error(err))
-			}
-		}()
-	}
-
-	// Set soft memory limit for GC if GOMEMLIMIT_MB is set.
-	// This makes Go's GC more aggressive when approaching the limit,
-	// reducing peak memory during load without affecting normal operation.
-	if memLimitMB := os.Getenv("GOMEMLIMIT_MB"); memLimitMB != "" {
-		mb, err := strconv.ParseInt(memLimitMB, 10, 64)
-		if err != nil || mb <= 0 {
-			logger.Info("invalid GOMEMLIMIT_MB value, ignoring; expected a positive integer (e.g. GOMEMLIMIT_MB=150)",
-				zap.String("value", memLimitMB))
-		} else {
-			debug.SetMemoryLimit(mb * 1024 * 1024)
-			logger.Info("GOMEMLIMIT set", zap.Int64("MB", mb))
-		}
-	}
-
-	// Start background memory monitor only when GOMEMLIMIT_MB is set.
-	// Calls FreeOSMemory on sharp heap drops to force fast OS page release.
-	// Gated to avoid periodic ReadMemStats overhead for commands that don't need it.
-	if os.Getenv("GOMEMLIMIT_MB") != "" {
-		go func() {
-			var prevInUse uint64
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					var m runtime.MemStats
-					runtime.ReadMemStats(&m)
-					if prevInUse > 0 && m.HeapInuse < prevInUse/2 {
-						debug.FreeOSMemory()
-					}
-					prevInUse = m.HeapInuse
-				}
-			}
-		}()
-	}
-
-	// Early check: If Docker command detected and not running as root, re-exec with sudo
-	// This must happen before any other initialization to ensure clean process handoff
-	if utils.ShouldReexecWithSudo() {
-		utils.ReexecWithSudo(logger)
-		// ReexecWithSudo calls syscall.Exec which replaces the process, so this line
-		// is only reached if there's an error (which is handled inside ReexecWithSudo)
-		return
-	}
-
-	if cpuProfile := os.Getenv("CPU_PROFILE"); cpuProfile != "" {
-		f, err := os.Create(cpuProfile)
-		if err != nil {
-			logger.Error("could not create CPU profile", zap.Error(err))
-		} else {
-			if err := pprof.StartCPUProfile(f); err != nil {
-				logger.Error("could not start CPU profile", zap.Error(err))
-				f.Close()
-			} else {
-				logger.Info("CPU profiling enabled", zap.String("file", cpuProfile))
-				defer func() {
-					pprof.StopCPUProfile()
-					f.Close()
-					logger.Info("CPU profiling stopped", zap.String("file", cpuProfile))
-				}()
-			}
-		}
-	}
-
-	if heapProfile := os.Getenv("HEAP_PROFILE"); heapProfile != "" {
-		logger.Info("Heap profiling enabled", zap.String("file", heapProfile))
-		defer func() {
-			f, err := os.Create(heapProfile)
-			if err != nil {
-				logger.Error("could not create Heap profile", zap.Error(err))
-				return
-			}
-			defer f.Close()
-			runtime.GC() // get up-to-date statistics
-			if err := pprof.WriteHeapProfile(f); err != nil {
-				logger.Error("could not write Heap profile", zap.Error(err))
-			} else {
-				logger.Info("Heap profile written", zap.String("file", heapProfile))
-			}
-		}()
-	}
-
-	defer func() {
-		inDocker := os.Getenv("KEPLOY_INDOCKER")
-		if inDocker != "true" {
-			if utils.LogFile != nil {
-				err := utils.LogFile.Close()
-				if err != nil {
-					utils.LogError(logger, err, "Failed to close Keploy Logs")
-				}
-			}
-			if err := utils.DeleteFileIfNotExists(logger, "keploy-logs.txt"); err != nil {
-				return
-			}
-			if err := utils.DeleteFileIfNotExists(logger, "docker-compose-tmp.yaml"); err != nil {
-				return
-			}
-		}
-	}()
-	defer utils.Recover(logger)
-
-	// The 'umask' command is commonly used in various operating systems to regulate the permissions of newly created files.
-	// These 'umask' values subtract from the permissions assigned by the process, effectively lowering the permissions.
-	// For example, if a file is created with permissions '777' and the 'umask' is '022', the resulting permissions will be '755',
-	// reducing certain permissions for security purposes.
-	// Setting 'umask' to '0' ensures that 'keploy' can precisely control the permissions of the files it creates.
-	// However, it's important to note that this approach may not work in scenarios involving mounted volumes,
-	// as the 'umask' is set by the host system, and cannot be overridden by 'keploy' or individual processes.
-	oldMask := utils.SetUmask()
-	defer utils.RestoreUmask(oldMask)
-
-	if dsn != "" {
-		utils.SentryInit(logger, dsn)
-		//logger = utils.ModifyToSentryLogger(ctx, logger, sentry.CurrentHub().Client(), configDb)
-	}
-	conf := config.New()
-	conf.APIServerURL = apiServerURI
-	conf.GitHubClientID = gitHubClientID
-
-	// Capture the full command used for test runs (to be stored in report)
-	conf.Test.CmdUsed = utils.GetFullCommandUsed()
-	userDb := userDb.New(logger, conf)
-	conf.InstallationID, err = userDb.GetInstallationID(ctx)
-	if err != nil {
-		errMsg := "failed to get installation id"
-		utils.LogError(logger, err, errMsg)
+		// If we can't create a logger, fall back to stderr
+		os.Stderr.WriteString("failed to initialize logger: " + err.Error() + "\n")
 		os.Exit(1)
 	}
+	defer logger.Sync() //nolint:errcheck // best-effort sync on exit
 
-	svcProvider := provider.NewServiceProvider(logger, conf)
-	cmdConfigurator := provider.NewCmdConfigurator(logger, conf)
-	rootCmd := cli.Root(ctx, logger, svcProvider, cmdConfigurator)
-	if err := rootCmd.Execute(); err != nil {
-		if strings.HasPrefix(err.Error(), "unknown command") || strings.HasPrefix(err.Error(), "unknown shorthand") {
-			fmt.Println("Error: ", err.Error())
-			fmt.Println("Run 'keploy --help' for usage.")
-			os.Exit(1)
-		}
-	}
+	// Create a root context that is cancelled on OS interrupt signals.
+	// This allows all components to perform graceful shutdown.
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+		syscall.SIGINT,
+	)
+	defer stop()
 
-	// Restore keploy folder ownership if running under sudo (for Docker mode)
-	// This ensures the next native run doesn't hit permission issues
-	if conf.Path != "" {
-		utils.RestoreKeployFolderOwnership(logger, conf.Path)
+	// Execute the root CLI command. All sub-commands (record, test, mock, etc.)
+	// are registered inside the cmd package.
+	if err := cmd.Execute(ctx, logger); err != nil {
+		logger.Error("keploy exited with error", zap.Error(err))
+		os.Exit(1)
 	}
-}
-
-// maybeAttachDebugFileSink reads KEPLOY_DEBUG_FILE and, if set, opens that
-// path and attaches a debug-level file sink onto logger via the same
-// in-place pointee mutation pattern the rest of the codebase uses for
-// runtime logger swaps (see ChangeLogLevel / RedirectToStderr). Returns
-// the opened file and sink handle so the caller can defer Flush + Close.
-//
-// All errors are non-fatal — if the file can't be opened (read-only mount,
-// permission, etc.), the process continues with the original logger.
-func maybeAttachDebugFileSink(logger *zap.Logger) (*os.File, *log.DebugFileSink) {
-	path := strings.TrimSpace(os.Getenv("KEPLOY_DEBUG_FILE"))
-	if path == "" {
-		return nil, nil
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		logger.Warn("KEPLOY_DEBUG_FILE set but could not be opened; continuing without debug capture",
-			zap.String("path", path), zap.Error(err))
-		return nil, nil
-	}
-	wrapped, sink := log.AddDebugFileSink(logger, f, 100<<20)
-	if wrapped == nil || sink == nil {
-		_ = f.Close()
-		return nil, nil
-	}
-	*logger = *wrapped
-	// Publish the sink so cross-package helpers (e.g. the agent's
-	// per-test-set rotation in pkg/agent/routes) can reach it without
-	// threading the sink through every constructor.
-	log.SetDebugFileSink(sink)
-	logger.Debug("KEPLOY_DEBUG_FILE attached", zap.String("path", path))
-	return f, sink
 }
