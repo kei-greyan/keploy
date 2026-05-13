@@ -15,7 +15,7 @@ import (
 
 func main() {
 	// Initialize a temporary logger for startup errors
-	logger, err := zap.NewProduction()
+	logger, err := zap.NewDevelopment()
 	if err != nil {
 		// If we can't create a logger, fall back to stderr
 		os.Stderr.WriteString("failed to initialize logger: " + err.Error() + "\n")
