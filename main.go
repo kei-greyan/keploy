@@ -15,8 +15,8 @@ import (
 
 func main() {
 	// Initialize a temporary logger for startup errors.
-	// Using NewProduction for less verbose output compared to NewDevelopment.
-	logger, err := zap.NewProduction()
+	// Using NewDevelopment for more verbose, human-readable output during local experimentation.
+	logger, err := zap.NewDevelopment()
 	if err != nil {
 		// If we can't create a logger, fall back to stderr
 		os.Stderr.WriteString("failed to initialize logger: " + err.Error() + "\n")
